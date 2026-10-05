@@ -3,6 +3,29 @@
 用于让两个模型在**同一条去噪时间轴**上接力，而不是把多个普通
 KSampler 串联后重复加噪。
 
+## Qwen Image 2.1 加速采样器
+
+本仓库同时包含原有模型接力节点和 Qwen Image 2.1 专用节点：
+
+- `Qwen Image 2.1 加速采样器`：一体化单采，支持残差缓存加速。
+- `Qwen Image 2.1 双采（百分比）`：两个 Qwen 2.1 模型在共同 sigma 处交接。
+- `Qwen Image 2.1 双采（SNR）`：按噪声强度选择交接点。
+- `Qwen Image 2.1 Speedup`：供已有 KSampler 工作流使用的模型补丁入口。
+
+Qwen 节点分类为 `采样/Qwen Image 2.1`，旧模型补丁在 `model/patch`。
+详细接线、内部放大、参数与历史测试记录见
+[Qwen Image 2.1 使用说明](qwen_image_2_1_speedup/README.md)。
+
+Qwen 功能需要已支持 Qwen Image 2.1 的 ComfyUI，使用宿主提供的 PyTorch、
+`comfy_api.latest`、`comfy.model_prefetch` 和 `typing_extensions`。
+如果缺少这些导入，启动日志会说明 Qwen 节点未载入；原有模型接力节点仍保留。
+
+当前上传的是已有采样实现，**没有新增 CFG=4 专用优化或修复 ComfyUI 原生 KV
+缓存**。部分版本在 CFG>1 的正负条件缓存切换时会报张量尺寸错误；对应的显式
+关闭方法及限制见上述 Qwen 使用说明。
+
+下面各节描述原有模型接力节点；其默认参数与 Qwen 专用节点不同。
+
 ## 节点
 
 - `模型接力采样器（双采·百分比）`
@@ -129,7 +152,20 @@ Illustrious → Illustrious、Flux → Flux。SDXL → Flux、SD1.5 → Flux
 
 ## 安装
 
-将整个 `comfyui_model_relay_sampler` 文件夹复制到：
+可以在 ComfyUI 的 `custom_nodes` 目录运行：
+
+```bash
+git clone https://github.com/zb18626140292-crypto/ComfyUI-Model-Relay-Sampler.git
+```
+
+仓库入口已同时注册旧接力节点和 Qwen 节点，不需要再独立安装
+`qwen_image_2_1_speedup`。不要同时启用独立 Qwen 包与本整合包，以免重复注册同名
+节点。已有手动安装的旧包建议先保留备份，再只启用一套同名节点。
+
+也可以手动安装：
+
+将本仓库根目录（包含根 `__init__.py`、`model_relay_sampler.py`、`js/` 和
+`qwen_image_2_1_speedup/`）作为一个完整的 `ComfyUI-Model-Relay-Sampler` 文件夹复制到：
 
 `ComfyUI/custom_nodes/`
 
