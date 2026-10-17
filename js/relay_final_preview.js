@@ -33,6 +33,17 @@ function samplerFor(output) {
     return sampled.node;
 }
 
+function clearFinalThumbnail(node) {
+    if (!SAMPLERS.has(node?.comfyClass || node?.type)) return;
+    const output = app.nodeOutputs[node.id];
+    if (output && Object.hasOwn(output, "images")) {
+        const remaining = { ...output };
+        delete remaining.images;
+        app.nodeOutputs[node.id] = remaining;
+    }
+    delete node.images;
+}
+
 async function showFinalPreview({ detail }) {
     const images = detail?.output?.images;
     if (!Array.isArray(images) || !images[0]?.filename) return;
@@ -51,9 +62,8 @@ async function showFinalPreview({ detail }) {
     if (version !== executionVersion || app.graph !== graph
         || graph.getNodeById(sampler.id) !== sampler || samplerFor(output) !== sampler) return;
 
-    // Use the same native preview event as sampling, but with the saved VAE image.
-    app.nodeOutputs[sampler.id] = { ...app.nodeOutputs[sampler.id], images: [...images] };
-    sampler.images = [...images];
+    // Update the existing preview only; image outputs create a second gallery.
+    clearFinalThumbnail(sampler);
     api.dispatchCustomEvent("b_preview_with_metadata", {
         blob, displayNodeId: String(sampler.id), jobId: detail.prompt_id,
     });
@@ -62,6 +72,12 @@ async function showFinalPreview({ detail }) {
 
 app.registerExtension({
     name: "ModelRelaySampler.FinalPreview",
+    nodeCreated(node) {
+        clearFinalThumbnail(node);
+    },
+    loadedGraphNode(node) {
+        clearFinalThumbnail(node);
+    },
     setup() {
         if (initialized) return;
         initialized = true;
