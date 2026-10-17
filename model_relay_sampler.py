@@ -727,6 +727,31 @@ def _run_relay(
             f"{expected_channels} channels."
         )
 
+    if len(stages) == 1 and (final_width > 0 or final_height > 0):
+        resize_started = time.perf_counter()
+        latent_image, did_resize = _upscale_latent_if_needed(
+            latent_image, models[0], final_width, final_height, upscale_method,
+        )
+        if did_resize:
+            output["samples"] = latent_image
+            noise_mask = output.get("noise_mask")
+            if torch.is_tensor(noise_mask) and noise_mask.ndim in (3, 4):
+                mask_was_3d = noise_mask.ndim == 3
+                if mask_was_3d:
+                    noise_mask = noise_mask.unsqueeze(1)
+                noise_mask = comfy.utils.common_upscale(
+                    noise_mask, latent_image.shape[-1], latent_image.shape[-2],
+                    "bilinear", "disabled",
+                )
+                output["noise_mask"] = noise_mask[:, 0] if mask_was_3d else noise_mask
+            LOGGER.info(
+                "Model Relay single-stage input latent resize after format normalization: "
+                "%dx%d latent pixels, method=%s",
+                latent_image.shape[-1], latent_image.shape[-2], upscale_method,
+            )
+        if statistics is not None:
+            statistics["timings"]["upscale_seconds"] = time.perf_counter() - resize_started
+
     if denoise <= 0.0:
         output.pop("downscale_ratio_spacial", None)
         output.pop("downscale_ratio_temporal", None)
@@ -996,47 +1021,9 @@ def _run_dual_independent(
     graph_context=None,
 ):
     if len(stages) == 1:
-        single_latent = latent
-        if final_width > 0 or final_height > 0:
-            resize_started = time.perf_counter()
-            resized_samples, did_resize = _upscale_latent_if_needed(
-                latent["samples"],
-                stages[0]["model"],
-                final_width,
-                final_height,
-                upscale_method,
-            )
-            if did_resize:
-                single_latent = latent.copy()
-                single_latent["samples"] = resized_samples
-                noise_mask = single_latent.get("noise_mask")
-                if torch.is_tensor(noise_mask) and noise_mask.ndim in (3, 4):
-                    mask_was_3d = noise_mask.ndim == 3
-                    if mask_was_3d:
-                        noise_mask = noise_mask.unsqueeze(1)
-                    noise_mask = comfy.utils.common_upscale(
-                        noise_mask,
-                        resized_samples.shape[-1],
-                        resized_samples.shape[-2],
-                        "bilinear",
-                        "disabled",
-                    )
-                    single_latent["noise_mask"] = (
-                        noise_mask[:, 0] if mask_was_3d else noise_mask
-                    )
-                LOGGER.info(
-                    "Model Relay single-stage input latent resize before "
-                    "sampling: %dx%d latent pixels, method=%s",
-                    resized_samples.shape[-1],
-                    resized_samples.shape[-2],
-                    upscale_method,
-                )
-            if statistics is not None:
-                statistics["timings"]["upscale_seconds"] = time.perf_counter() - resize_started
-
         return _run_relay(
             stages,
-            single_latent,
+            latent,
             seed,
             steps_1,
             scheduler_1,
@@ -1047,8 +1034,8 @@ def _run_dual_independent(
             0,
             memory_mode,
             force_offload_after_stage,
-            0,
-            0,
+            final_width,
+            final_height,
             upscale_method,
             upscale_denoise_strength,
             statistics,
