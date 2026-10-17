@@ -1,13 +1,16 @@
 import logging
+import math
 import time
 
 import torch
 
 import comfy.model_management
+import comfy.patcher_extension
 import comfy.sample
 import comfy.samplers
 import comfy.utils
 import latent_preview
+from comfy_execution.graph_utils import GraphBuilder
 
 
 LOGGER = logging.getLogger(__name__)
@@ -18,7 +21,12 @@ COMPATIBILITY_MODES = (
     "unsafe",
 )
 HANDOFF_MODES = ("snr", "percent")
-MEMORY_MODES = ("auto_balance", "vram_saver", "speed_first")
+MEMORY_MODES = (
+    "auto_balance",
+    "vram_saver",
+    "speed_first",
+    "offload_after_sampling",
+)
 # Keep legacy booleans in the server-side combo contract so old API prompts
 # still validate. The frontend extension exposes only the two Chinese labels.
 STAGE_TOGGLE_OPTIONS = (False, True, "关闭", "开启")
@@ -30,6 +38,95 @@ _STAGE_TWO_CONNECTION_INPUTS = (
     "stage_two_positive",
     "stage_two_negative",
 )
+_STATISTICS_KEY = "model_relay_sampler_statistics"
+
+
+class _ForwardCounter:
+    def __init__(self, statistics):
+        self.statistics = statistics
+
+    def __call__(self, executor, *args, **kwargs):
+        self.statistics["forward_calls"] += 1
+        return executor(*args, **kwargs)
+
+
+class _PhaseTimer:
+    def __init__(self, statistics, field):
+        self.statistics = statistics
+        self.field = field
+
+    def __call__(self, executor, *args, **kwargs):
+        if self.field == "sampling_seconds":
+            sigmas = args[1] if len(args) > 1 else kwargs["sigmas"]
+            self.statistics["steps"] += max(0, sigmas.shape[-1] - 1)
+        started = time.perf_counter()
+        try:
+            return executor(*args, **kwargs)
+        finally:
+            self.statistics[self.field] = (
+                self.statistics.get(self.field, 0.0) + time.perf_counter() - started
+            )
+
+
+def _statistics_model(model, statistics):
+    if statistics is None:
+        return model
+    model = model.clone()
+    statistics.setdefault("steps", 0)
+    statistics.setdefault("forward_calls", 0)
+    for wrapper, function in (
+        (comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, _ForwardCounter(statistics)),
+        (comfy.patcher_extension.WrappersMP.PREPARE_SAMPLING, _PhaseTimer(statistics, "prepare_seconds")),
+        (comfy.patcher_extension.WrappersMP.SAMPLER_SAMPLE, _PhaseTimer(statistics, "sampling_seconds")),
+    ):
+        model.remove_wrappers_with_key(wrapper, _STATISTICS_KEY)
+        model.add_wrapper_with_key(wrapper, _STATISTICS_KEY, function)
+    return model
+
+
+def _execution_result(results, statistics, model):
+    samples = results[0]["samples"]
+    ratio = _format_signature(model)["spatial_ratio"]
+    statistics["width"] = None if samples.is_nested else int(samples.shape[-1]) * ratio
+    statistics["height"] = None if samples.is_nested else int(samples.shape[-2]) * ratio
+    summaries = []
+    for index, stage in enumerate(statistics.get("stages", []), 1):
+        summaries.append(
+            f"模型{index}：{stage['steps']}步，前向调用{stage.get('forward_calls', 0)}次，阶段{stage['seconds']:.2f}秒"
+        )
+        if "prepare_seconds" in stage:
+            summaries.append(
+                f"  准备/加载{stage['prepare_seconds']:.2f}秒，采样{stage.get('sampling_seconds', 0.0):.2f}秒"
+            )
+    size = (f"{statistics['width']}×{statistics['height']}"
+            if statistics["width"] is not None else "嵌套潜变量")
+    summaries.append(f"输出：{size}，总计{statistics['total_seconds']:.2f}秒")
+    if "handoff_sigma" in statistics:
+        summary = f"交接σ={statistics['handoff_sigma']:.4f}"
+        if "restart_sigma" in statistics:
+            summary += f"，重绘σ={statistics['restart_sigma']:.4f}"
+        summaries.append(summary)
+    timings = statistics.get("timings", {})
+    if timings.get("unload_seconds", 0.0) or timings.get("upscale_seconds", 0.0):
+        summaries.append(
+            f"缩放{timings.get('upscale_seconds', 0.0):.2f}秒，卸载{timings.get('unload_seconds', 0.0):.2f}秒"
+        )
+    if timings.get("memory_prepare_seconds", 0.0):
+        summaries.append(f"显存准备{timings['memory_prepare_seconds']:.2f}秒")
+    LOGGER.info("Model Relay execution: %s", " | ".join(summaries))
+    return results
+
+
+def _unload_stage_model(model, statistics=None):
+    started = time.perf_counter()
+    try:
+        comfy.model_management.unload_model_and_clones(
+            model, unload_additional_models=True, all_devices=True,
+        )
+    finally:
+        if statistics is not None:
+            timings = statistics["timings"]
+            timings["unload_seconds"] = timings.get("unload_seconds", 0.0) + time.perf_counter() - started
 
 
 def _stage_is_enabled(value):
@@ -171,8 +268,16 @@ def _stage_phases(start, end, stage_index, stage_count, transition_steps):
 def _should_offload(stages, stage_index, memory_mode, legacy_force_offload):
     if legacy_force_offload or memory_mode == "vram_saver":
         return True
+    if (
+        memory_mode == "offload_after_sampling"
+        and stage_index >= len(stages) - 1
+    ):
+        return True
     if memory_mode == "speed_first" or stage_index >= len(stages) - 1:
         return False
+
+    if memory_mode == "offload_after_sampling":
+        memory_mode = "auto_balance"
 
     # In balanced mode, proactively offload only when the next full model plus
     # a modest inference reserve would not fit in currently free VRAM.
@@ -245,7 +350,8 @@ def _prepare_first_stage_vram(memory_mode, first_model):
     loaded = comfy.model_management.loaded_models()
     conflicting_clones = []
     reason = None
-    if memory_mode == "auto_balance":
+    auto_balance_mode = memory_mode in ("auto_balance", "offload_after_sampling")
+    if auto_balance_mode:
         first_base = getattr(first_model, "clone_base_uuid", None)
         first_patches = getattr(first_model, "patches_uuid", None)
         conflicting_clones = [
@@ -259,7 +365,7 @@ def _prepare_first_stage_vram(memory_mode, first_model):
     device = comfy.model_management.get_torch_device()
     free_before = int(comfy.model_management.get_free_memory(device))
     loaded_before = len(loaded)
-    if memory_mode == "auto_balance":
+    if auto_balance_mode:
         if conflicting_clones:
             reason = f"stale-lora-clones:{len(conflicting_clones)}"
         else:
@@ -401,7 +507,10 @@ def _upscale_latent_if_needed(
 
 
 def _upscale_restart_sigma_scale(
-    model, handoff_sigma, upscale_denoise_strength=UPSCALE_RENOISE_FRACTION
+    model,
+    handoff_sigma,
+    upscale_denoise_strength=UPSCALE_RENOISE_FRACTION,
+    redraw_mode="旧版噪声上限",
 ):
     handoff_sigma = float(handoff_sigma)
     if handoff_sigma <= 0.0:
@@ -409,10 +518,12 @@ def _upscale_restart_sigma_scale(
 
     model_sampling = model.get_model_object("model_sampling")
     sigma_max = float(model_sampling.sigma_max)
-    safe_sigma = max(
-        0.0, sigma_max * max(0.0, min(1.0, float(upscale_denoise_strength)))
-    )
-    restart_sigma = min(handoff_sigma, safe_sigma)
+    redraw_strength = max(0.0, min(1.0, float(upscale_denoise_strength)))
+    if redraw_mode == "按交接噪声比例":
+        restart_sigma = handoff_sigma * redraw_strength
+    else:
+        safe_sigma = max(0.0, sigma_max * redraw_strength)
+        restart_sigma = min(handoff_sigma, safe_sigma)
     return restart_sigma / handoff_sigma, restart_sigma
 
 
@@ -447,11 +558,31 @@ def _dual_sigma_pair(
         raise ValueError("双采接力要求第一采和第二采都至少设置 2 个计划步数。")
 
     if handoff_mode == "percent":
-        stage_2_start = int(round(steps_2 * float(handoff_value) / 100.0))
-        stage_2_start = max(1, min(stage_2_start, steps_2 - 1))
-    else:
-        target_sigma = 10.0 ** (-float(handoff_value) / 20.0)
-        stage_2_start = _nearest_sigma_index(sigmas_2, target_sigma)
+        # Percent controls integer step counts, not a nearest-sigma lookup.
+        # Use round-half-up so e.g. 8 steps at 37% is exactly 3 + 5.
+        fraction = float(handoff_value) / 100.0
+        stage_1_end = max(1, min(math.floor(steps_1 * fraction + 0.5), steps_1 - 1))
+        stage_2_start = max(1, min(math.floor(steps_2 * fraction + 0.5), steps_2 - 1))
+        stage_1_sigmas = sigmas_1[:stage_1_end + 1].clone()
+        boundary = stage_1_sigmas[-1].clone()
+        stage_2_sigmas = sigmas_2[stage_2_start:].clone()
+        if float(boundary) <= 0.0 or float(stage_2_sigmas[0]) <= 0.0:
+            raise ValueError("百分比交接点的 sigma 必须大于 0，请降低交接百分比。")
+        # Keep the actual stage-one noise level at the handoff, and preserve
+        # stage two's tail spacing without changing either stage's step count.
+        stage_2_sigmas *= boundary / stage_2_sigmas[0].clone()
+        stage_2_sigmas[0] = boundary
+        if stage_1_end < int(minimum_stage_1_steps):
+            LOGGER.warning(
+                "Model Relay percent: strict stage1=%s steps is below the upscale "
+                "reference minimum=%s; raise the handoff percent if stage one is unfinished.",
+                stage_1_end, minimum_stage_1_steps,
+            )
+        return (stage_1_sigmas, stage_2_sigmas, stage_1_end,
+                stage_2_start, float(boundary), False)
+
+    target_sigma = 10.0 ** (-float(handoff_value) / 20.0)
+    stage_2_start = _nearest_sigma_index(sigmas_2, target_sigma)
 
     boundary_sigma = float(sigmas_2[stage_2_start])
     stage_1_end = _nearest_sigma_index(sigmas_1, boundary_sigma)
@@ -489,6 +620,35 @@ def _dual_sigma_pair(
     )
 
 
+def _qwen21_cache_compatible_model(model):
+    """Keep Qwen Image 2.1's broken multi-slot prefix cache out of relay sampling."""
+    base_model = getattr(model, "model", None)
+    if not any(
+        cls.__module__ == "comfy.model_base" and cls.__name__ == "QwenImage21"
+        for cls in type(base_model).__mro__
+    ):
+        return model
+
+    cache_options = model.model_options.get("transformer_options", {}).get(
+        "qwen_image21_cache", {}
+    )
+    if cache_options.get("device") == "off":
+        return model
+
+    # The model clone preserves LoRA patches and sampler wrappers while keeping
+    # this stage's cache setting out of the upstream MODEL connection.
+    sampling_model = model.clone()
+    transformer_options = sampling_model.model_options.setdefault(
+        "transformer_options", {}
+    )
+    transformer_options["qwen_image21_cache"] = {**cache_options, "device": "off"}
+    LOGGER.info(
+        "Model Relay: Qwen Image 2.1 prefix cache disabled for this stage "
+        "to avoid the ComfyUI multi-slot cache error"
+    )
+    return sampling_model
+
+
 def _sample_stage(
     model,
     positive,
@@ -500,10 +660,13 @@ def _sample_stage(
     noise,
     noise_mask,
     seed,
+    statistics=None,
 ):
     if sigmas.shape[-1] <= 1:
         return latent_image
 
+    model = _qwen21_cache_compatible_model(model)
+    model = _statistics_model(model, statistics)
     sampler = comfy.samplers.sampler_object(sampler_name)
     stage_steps = sigmas.shape[-1] - 1
     callback = latent_preview.prepare_callback(model, stage_steps)
@@ -542,6 +705,7 @@ def _run_relay(
     final_height,
     upscale_method,
     upscale_denoise_strength=UPSCALE_RENOISE_FRACTION,
+    statistics=None,
 ):
     models = [stage["model"] for stage in stages]
     signatures = _check_compatibility(models, compatibility)
@@ -586,7 +750,10 @@ def _run_relay(
             or target_height != latent_image.shape[-2]
         )
 
+    prepare_started = time.perf_counter()
     _prepare_first_stage_vram(memory_mode, models[0])
+    if statistics is not None:
+        statistics["timings"]["memory_prepare_seconds"] = time.perf_counter() - prepare_started
 
     for stage_index, (stage, start, end) in enumerate(
         zip(stages, boundaries, boundaries[1:])
@@ -602,6 +769,12 @@ def _run_relay(
             stage["cfg"],
             handoff_mode,
         )
+        stage_stats = None
+        if statistics is not None:
+            stage_stats = {"steps": 0, "planned_steps": steps, "cfg": stage["cfg"], "forward_calls": 0}
+            statistics["stages"].append(stage_stats)
+        stage_started = time.perf_counter()
+        stage_complete = False
         try:
             phases = _stage_phases(
                 start, end, stage_index, len(stages), transition_steps
@@ -638,10 +811,14 @@ def _run_relay(
                     noise,
                     noise_mask,
                     seed,
+                    stage_stats,
                 )
                 noise_has_been_added = True
+            stage_complete = True
         finally:
-            if _should_offload(
+            if stage_stats is not None:
+                stage_stats["seconds"] = time.perf_counter() - stage_started
+            if (memory_mode == "offload_after_sampling" and not stage_complete) or _should_offload(
                 stages, stage_index, memory_mode, force_offload_after_stage
             ):
                 LOGGER.info(
@@ -651,11 +828,7 @@ def _run_relay(
                     len(stages),
                     memory_mode,
                 )
-                comfy.model_management.unload_model_and_clones(
-                    stage["model"],
-                    unload_additional_models=True,
-                    all_devices=True,
-                )
+                _unload_stage_model(stage["model"], statistics)
 
         stage_output = output.copy()
         stage_output.pop("downscale_ratio_spacial", None)
@@ -696,6 +869,109 @@ def _run_relay(
     return stage_outputs[-1], stage_outputs
 
 
+def _independent_first_stage(stage, latent, seed, sigmas, memory_mode, offload,
+                              statistics=None, normalized=False):
+    output = latent.copy()
+    if not normalized:
+        output["samples"] = comfy.sample.fix_empty_latent_channels(
+            stage["model"], latent["samples"], latent.get("downscale_ratio_spacial"),
+            latent.get("downscale_ratio_temporal"),
+        )
+    output.pop("downscale_ratio_spacial", None)
+    output.pop("downscale_ratio_temporal", None)
+    started = time.perf_counter()
+    _prepare_first_stage_vram(memory_mode, stage["model"])
+    if statistics is not None:
+        statistics["timings"]["memory_prepare_seconds"] = time.perf_counter() - started
+    stage_stats = None
+    if statistics is not None:
+        stage_stats = {"steps": 0, "cfg": stage["cfg"], "forward_calls": 0}
+        statistics["stages"].append(stage_stats)
+    started = time.perf_counter()
+    complete = False
+    try:
+        output["samples"] = _sample_stage(
+            stage["model"], stage["positive"], stage["negative"], stage["cfg"],
+            stage["sampler"], sigmas, output["samples"], _random_noise(output, seed),
+            output.get("noise_mask"), seed, stage_stats,
+        )
+        complete = True
+    finally:
+        elapsed = time.perf_counter() - started
+        if stage_stats is not None:
+            stage_stats["seconds"] = elapsed
+        offload = offload() if callable(offload) else offload
+        offload |= memory_mode == "offload_after_sampling" and not complete
+        _log_stage_timing(1, stage["model"], elapsed, offload)
+        if offload:
+            _unload_stage_model(stage["model"], statistics)
+    return output
+
+
+def _independent_second_stage(stage, first_output, seed, sigmas, boundary_sigma,
+                              final_width, final_height, upscale_method,
+                              redraw_strength, redraw_mode, offload, statistics=None):
+    output = first_output.copy()
+    # A sampler or wrapper must not overwrite a checkpoint retained by ComfyUI.
+    samples = first_output["samples"].clone()
+    noise_mask = output.get("noise_mask")
+    started = time.perf_counter()
+    samples, did_upscale = _upscale_latent_if_needed(
+        samples, stage["model"], final_width, final_height, upscale_method,
+    )
+    noise = None
+    if did_upscale:
+        scale, restart_sigma = _upscale_restart_sigma_scale(
+            stage["model"], boundary_sigma, redraw_strength, redraw_mode,
+        )
+        sigmas = sigmas * scale
+        sigmas[-1] = 0.0
+        upscaled = output.copy()
+        upscaled["samples"] = samples
+        noise = _random_noise(upscaled, seed)
+        if noise_mask is not None and noise_mask.shape[-2:] != samples.shape[-2:]:
+            noise_mask = None
+        LOGGER.info(
+            "Model Relay upscale restart: strength=%.3f, sigma %.6f -> %.6f, %d high-resolution steps",
+            redraw_strength, boundary_sigma, restart_sigma, len(sigmas) - 1,
+        )
+        if statistics is not None:
+            statistics["restart_sigma"] = restart_sigma
+    if statistics is not None:
+        statistics["timings"]["upscale_seconds"] = time.perf_counter() - started
+    if noise is None:
+        noise = _empty_noise_like(samples)
+    stage_stats = None
+    if statistics is not None:
+        stage_stats = {"steps": 0, "cfg": stage["cfg"], "forward_calls": 0}
+        statistics["stages"].append(stage_stats)
+    started = time.perf_counter()
+    try:
+        output["samples"] = _sample_stage(
+            stage["model"], stage["positive"], stage["negative"], stage["cfg"],
+            stage["sampler"], sigmas, samples, noise, noise_mask, seed, stage_stats,
+        )
+    finally:
+        elapsed = time.perf_counter() - started
+        if stage_stats is not None:
+            stage_stats["seconds"] = elapsed
+        _log_stage_timing(2, stage["model"], elapsed, offload)
+        if offload:
+            _unload_stage_model(stage["model"], statistics)
+    return output
+
+
+def _sigma_payload(sigmas):
+    return {"values": sigmas.detach().cpu().tolist(), "dtype": str(sigmas.dtype).split(".")[-1]}
+
+
+def _payload_sigmas(payload):
+    if torch.is_tensor(payload):
+        return payload
+    return torch.tensor(payload["values"], dtype=getattr(torch, payload["dtype"]),
+                        device=comfy.model_management.intermediate_device())
+
+
 def _run_dual_independent(
     stages,
     latent,
@@ -715,10 +991,14 @@ def _run_dual_independent(
     upscale_method,
     upscale_denoise_strength,
     minimum_upscale_stage_1_steps,
+    redraw_mode="旧版噪声上限",
+    statistics=None,
+    graph_context=None,
 ):
     if len(stages) == 1:
         single_latent = latent
         if final_width > 0 or final_height > 0:
+            resize_started = time.perf_counter()
             resized_samples, did_resize = _upscale_latent_if_needed(
                 latent["samples"],
                 stages[0]["model"],
@@ -751,6 +1031,8 @@ def _run_dual_independent(
                     resized_samples.shape[-2],
                     upscale_method,
                 )
+            if statistics is not None:
+                statistics["timings"]["upscale_seconds"] = time.perf_counter() - resize_started
 
         return _run_relay(
             stages,
@@ -769,6 +1051,7 @@ def _run_dual_independent(
             0,
             upscale_method,
             upscale_denoise_strength,
+            statistics,
         )
 
     models = [stage["model"] for stage in stages]
@@ -826,6 +1109,9 @@ def _run_dual_independent(
         handoff_value,
         minimum_stage_1_steps,
     )
+    if statistics is not None:
+        statistics["handoff_sigma"] = boundary_sigma
+        statistics["early_handoff_protected"] = protected
 
     stage_1_run_sigmas = stage_1_sigmas.clone()
     if upscale_requested:
@@ -847,111 +1133,44 @@ def _run_dual_independent(
         protected,
     )
 
-    _prepare_first_stage_vram(memory_mode, models[0])
+    if graph_context is not None:
+        first_offload = _should_offload(stages, 0, memory_mode, force_offload_after_stage)
+        second_offload = _should_offload(stages, 1, memory_mode, force_offload_after_stage)
+        dynprompt, unique_id = graph_context
+        raw = dynprompt.get_node(unique_id)["inputs"]
+        graph = GraphBuilder()
+        # Native child caching: preserve source links and key stage one by its
+        # effective sigma timeline, not unrelated stage-two controls.
+        first = graph.node(
+            "ModelRelaySamplerFirstStage", id="first",
+            model=raw["stage_one_model"], positive=raw["stage_one_positive"],
+            negative=raw["stage_one_negative"], latent_image=raw["latent_image"],
+            cfg=stages[0]["cfg"], sampler_name=stages[0]["sampler"], seed=seed,
+            sigmas=_sigma_payload(stage_1_run_sigmas), memory_mode=memory_mode,
+            offload=first_offload,
+        )
+        second = graph.node(
+            "ModelRelaySamplerSecondStage", id="second", first_result=first.out(0),
+            model=raw["stage_two_model"], positive=raw["stage_two_positive"],
+            negative=raw["stage_two_negative"], previous_model=raw["stage_one_model"],
+            cfg=stages[1]["cfg"], sampler_name=stages[1]["sampler"], seed=seed,
+            sigmas=_sigma_payload(stage_2_sigmas), boundary_sigma=boundary_sigma,
+            memory_mode=memory_mode, offload=second_offload,
+            final_width=final_width, final_height=final_height, upscale_method=upscale_method,
+            redraw_strength=upscale_denoise_strength, redraw_mode=redraw_mode,
+        )
+        return {"result": (second.out(0), first.out(0)), "expand": graph.finalize()}
 
-    noise_mask = output.get("noise_mask")
-    stage_1_started = time.perf_counter()
-    try:
-        latent_image = _sample_stage(
-            models[0],
-            stages[0]["positive"],
-            stages[0]["negative"],
-            stages[0]["cfg"],
-            stages[0]["sampler"],
-            stage_1_run_sigmas,
-            latent_image,
-            _random_noise(output, seed),
-            noise_mask,
-            seed,
-        )
-    finally:
-        stage_1_offload = _should_offload(
-            stages, 0, memory_mode, force_offload_after_stage
-        )
-        _log_stage_timing(
-            1,
-            models[0],
-            time.perf_counter() - stage_1_started,
-            stage_1_offload,
-        )
-        if stage_1_offload:
-            comfy.model_management.unload_model_and_clones(
-                models[0],
-                unload_additional_models=True,
-                all_devices=True,
-            )
-
-    stage_1_output = output.copy()
-    stage_1_output.pop("downscale_ratio_spacial", None)
-    stage_1_output.pop("downscale_ratio_temporal", None)
-    stage_1_output["samples"] = latent_image
-
-    stage_2_noise = _empty_noise_like(latent_image)
-    if upscale_requested:
-        latent_image, did_upscale = _upscale_latent_if_needed(
-            latent_image,
-            models[1],
-            final_width,
-            final_height,
-            upscale_method,
-        )
-        if did_upscale:
-            scale, restart_sigma = _upscale_restart_sigma_scale(
-                models[1], boundary_sigma, upscale_denoise_strength
-            )
-            stage_2_sigmas = stage_2_sigmas * scale
-            stage_2_sigmas[-1] = 0.0
-            upscaled = output.copy()
-            upscaled["samples"] = latent_image
-            stage_2_noise = _random_noise(upscaled, seed)
-            # A spatial noise mask from the base resolution cannot be reused
-            # at the enlarged resolution without explicit mask resampling.
-            if noise_mask is not None and noise_mask.shape[-2:] != latent_image.shape[-2:]:
-                noise_mask = None
-            LOGGER.info(
-                "Model Relay upscale restart: strength=%.3f, sigma %.6f -> %.6f, "
-                "%d high-resolution steps",
-                upscale_denoise_strength,
-                boundary_sigma,
-                restart_sigma,
-                len(stage_2_sigmas) - 1,
-            )
-
-    stage_2_started = time.perf_counter()
-    try:
-        latent_image = _sample_stage(
-            models[1],
-            stages[1]["positive"],
-            stages[1]["negative"],
-            stages[1]["cfg"],
-            stages[1]["sampler"],
-            stage_2_sigmas,
-            latent_image,
-            stage_2_noise,
-            noise_mask,
-            seed,
-        )
-    finally:
-        stage_2_offload = _should_offload(
-            stages, 1, memory_mode, force_offload_after_stage
-        )
-        _log_stage_timing(
-            2,
-            models[1],
-            time.perf_counter() - stage_2_started,
-            stage_2_offload,
-        )
-        if stage_2_offload:
-            comfy.model_management.unload_model_and_clones(
-                models[1],
-                unload_additional_models=True,
-                all_devices=True,
-            )
-
-    final_output = output.copy()
-    final_output.pop("downscale_ratio_spacial", None)
-    final_output.pop("downscale_ratio_temporal", None)
-    final_output["samples"] = latent_image
+    stage_1_output = _independent_first_stage(
+        stages[0], output, seed, stage_1_run_sigmas, memory_mode,
+        lambda: _should_offload(stages, 0, memory_mode, force_offload_after_stage),
+        statistics, normalized=True,
+    )
+    final_output = _independent_second_stage(
+        stages[1], stage_1_output, seed, stage_2_sigmas, boundary_sigma,
+        final_width, final_height, upscale_method, upscale_denoise_strength,
+        redraw_mode, _should_offload(stages, 1, memory_mode, force_offload_after_stage), statistics,
+    )
     return final_output, [stage_1_output, final_output.copy()]
 
 
@@ -1056,7 +1275,8 @@ def _common_inputs(
                     "auto_balance：按显存压力清理跨轮残留，并在下一模型可能"
                     "放不下时提前卸载；"
                     "vram_saver：每采结束必定卸载；"
-                    "speed_first：尽量保留模型缓存以提高速度。"
+                    "speed_first：尽量保留模型缓存以提高速度；"
+                    "offload_after_sampling：阶段间按 auto_balance 判断，完成后卸载。"
                 ),
             },
         ),
@@ -1520,7 +1740,8 @@ def _independent_dual_inputs(handoff_mode):
                     "tooltip": (
                         "auto_balance：按显存压力清理跨轮残留，并在交接时卸载"
                         "放不下的第一模型；vram_saver："
-                        "每阶段执行完都卸载；speed_first：优先保留缓存。"
+                        "每阶段执行完都卸载；speed_first：优先保留缓存；"
+                        "offload_after_sampling：阶段间按 auto_balance 判断，完成后卸载。"
                     ),
                 },
             ),
@@ -1540,11 +1761,15 @@ def _independent_dual_inputs(handoff_mode):
                 "default": 50.0,
                 "min": 1.0,
                 "max": 99.0,
-                "step": 1.0,
+                "step": 0.01,
+                "round": 0.01,
                 "display_name": "交接位置（百分比）",
                 "tooltip": (
-                    "只按第二采时间表选择共同 sigma。默认 50% 时，第一采 "
-                    "8 步计划约执行 4 步，第二采 12 步计划约执行后 6 步。"
+                    "支持小数点后两位，调整间隔 0.01%。实际采样仍按整步执行。"
+                    "强制按各模型计划步数四舍五入分配：模型一执行前面的百分比，"
+                    "模型二执行剩余部分，两边至少各 1 步。两边都为 8 步时，"
+                    "37% 就是 3+5，50% 就是 4+4。模型二时间表按一采交接噪声"
+                    "对齐，不会反查或自动推迟一采步数。"
                 ),
             },
         )
@@ -1574,9 +1799,9 @@ def _independent_dual_inputs(handoff_mode):
             "advanced": True,
             "display_name": "放大前最低一采步数",
             "tooltip": (
-                "仅在内部放大时生效。若交接过早，节点会把共同 sigma 自动"
-                "推迟到第一采至少完成这些步，避免未成形图被放大后出现融化、"
-                "重影。Krea 2 Turbo 8 步推荐 4。"
+                "仅在内部放大时生效。SNR 模式在交接过早时自动推迟到一采至少"
+                "完成这些步；百分比模式仅在后台提示，不改变强制分步。"
+                "若放大前图像未成形，请提高交接百分比。Krea 2 Turbo 8 步推荐 4。"
             ),
         },
     )
@@ -1593,7 +1818,19 @@ def _independent_dual_inputs(handoff_mode):
         },
     )
     required.update(_upscale_inputs())
-    return {"required": required, "optional": optional}
+    optional["redraw_mode"] = (
+        ("旧版噪声上限", "按交接噪声比例"),
+        {
+            "default": "旧版噪声上限",
+            "display_name": "放大重绘噪声模式",
+            "tooltip": (
+                "旧版噪声上限保持原行为；按交接噪声比例将重绘强度直接乘以"
+                "交接 sigma。"
+            ),
+        },
+    )
+    return {"required": required, "optional": optional,
+            "hidden": {"dynprompt": "DYNPROMPT", "unique_id": "UNIQUE_ID"}}
 
 
 class _ModelRelaySamplerDualIndependent:
@@ -1627,6 +1864,10 @@ class _ModelRelaySamplerDualIndependent:
         return [name for name, value in lazy_inputs.items() if value is None]
 
     def _sample_impl(self, handoff_value, **kwargs):
+        dynprompt = kwargs.pop("dynprompt", None)
+        unique_id = kwargs.pop("unique_id", None)
+        total_started = time.perf_counter()
+        statistics = {"stages": [], "timings": {"upscale_seconds": 0.0, "unload_seconds": 0.0}}
         stage_two_inputs = {
             name: kwargs.get(name, _MISSING_INPUT)
             for name in _STAGE_TWO_CONNECTION_INPUTS
@@ -1668,7 +1909,7 @@ class _ModelRelaySamplerDualIndependent:
                 }
             )
 
-        output, stage_outputs = _run_dual_independent(
+        result = _run_dual_independent(
             stages,
             kwargs["latent_image"],
             kwargs["seed"],
@@ -1687,15 +1928,23 @@ class _ModelRelaySamplerDualIndependent:
             kwargs["upscale_method"],
             kwargs["redraw_strength"],
             kwargs["minimum_upscale_stage_1_steps"],
+            kwargs.get("redraw_mode", "旧版噪声上限"),
+            statistics,
+            (dynprompt, unique_id) if dynprompt is not None else None,
         )
-        return output, stage_outputs[0]
+        if isinstance(result, dict):
+            return result
+        output, stage_outputs = result
+        statistics["total_seconds"] = time.perf_counter() - total_started
+        return _execution_result((output, stage_outputs[0]), statistics, kwargs["stage_one_model"])
 
 
 class ModelRelaySamplerDualPercent(_ModelRelaySamplerDualIndependent):
     HANDOFF_MODE = "percent"
     DESCRIPTION = (
-        "百分比交接专用双采节点。两套模型分别建立自己的 sigma 时间表，"
-        "在第二采时间表的指定百分比处对齐，不含任何 SNR 控件。"
+        "百分比交接专用双采节点。强制按各模型计划步数四舍五入分配，"
+        "模型二时间表对齐一采交接噪声；两边都为8步时37%就是3+5。"
+        "不含任何 SNR 控件，内部放大不会自动推迟百分比分步。"
     )
 
     @classmethod
@@ -1947,9 +2196,69 @@ class ModelRelaySamplerTriple:
         return (output, stage_1_output, stage_2_output)
 
 
+class _ModelRelaySamplerFirstStage:
+    DEV_ONLY = True
+    CATEGORY = "_internal/model_relay"
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "sample"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model": ("MODEL",), "positive": ("CONDITIONING",), "negative": ("CONDITIONING",),
+            "latent_image": ("LATENT",), "sigmas": ("SIGMAS",),
+            "cfg": ("FLOAT",), "sampler_name": (comfy.samplers.KSampler.SAMPLERS,),
+            "seed": ("INT",), "memory_mode": (MEMORY_MODES,), "offload": ("BOOLEAN",),
+        }}
+
+    def sample(self, model, positive, negative, latent_image, sigmas, cfg,
+               sampler_name, seed, memory_mode, offload):
+        stage = {"model": model, "positive": positive, "negative": negative,
+                 "cfg": cfg, "sampler": sampler_name}
+        return (_independent_first_stage(
+            stage, latent_image, seed, _payload_sigmas(sigmas), memory_mode, offload,
+        ),)
+
+
+class _ModelRelaySamplerSecondStage:
+    DEV_ONLY = True
+    CATEGORY = "_internal/model_relay"
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "sample"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model": ("MODEL",), "previous_model": ("MODEL",),
+            "positive": ("CONDITIONING",), "negative": ("CONDITIONING",),
+            "first_result": ("LATENT",), "sigmas": ("SIGMAS",),
+            "cfg": ("FLOAT",), "sampler_name": (comfy.samplers.KSampler.SAMPLERS,),
+            "seed": ("INT",), "boundary_sigma": ("FLOAT",), "memory_mode": (MEMORY_MODES,),
+            "offload": ("BOOLEAN",), "final_width": ("INT",), "final_height": ("INT",),
+            "upscale_method": (UPSCALE_METHODS,), "redraw_strength": ("FLOAT",),
+            "redraw_mode": (("旧版噪声上限", "按交接噪声比例"),),
+        }}
+
+    def sample(self, model, previous_model, positive, negative, first_result, sigmas,
+               cfg, sampler_name, seed, boundary_sigma, memory_mode, offload,
+               final_width, final_height, upscale_method, redraw_strength, redraw_mode):
+        if memory_mode == "vram_saver":
+            _prepare_first_stage_vram(memory_mode, model)
+        elif _should_offload([{"model": previous_model}, {"model": model}], 0, memory_mode, False):
+            _unload_stage_model(previous_model)
+        stage = {"model": model, "positive": positive, "negative": negative,
+                 "cfg": cfg, "sampler": sampler_name}
+        return (_independent_second_stage(
+            stage, first_result, seed, _payload_sigmas(sigmas), boundary_sigma,
+            final_width, final_height, upscale_method, redraw_strength, redraw_mode, offload,
+        ),)
+
+
 NODE_CLASS_MAPPINGS = {
     "ModelRelaySamplerDualPercent": ModelRelaySamplerDualPercent,
     "ModelRelaySamplerDualSNR": ModelRelaySamplerDualSNR,
+    "ModelRelaySamplerFirstStage": _ModelRelaySamplerFirstStage,
+    "ModelRelaySamplerSecondStage": _ModelRelaySamplerSecondStage,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {

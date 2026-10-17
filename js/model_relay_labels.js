@@ -27,6 +27,7 @@ const WIDGET_LABELS = {
     final_height: "最终高度",
     upscale_method: "放大方法",
     redraw_strength: "重绘强度",
+    redraw_mode: "放大重绘噪声模式",
 };
 
 const INPUT_LABELS = {
@@ -78,17 +79,19 @@ function installLabelOverrides(nodeType) {
     const originalConfigure = nodeType.prototype.configure;
     nodeType.prototype.configure = function (info) {
         // Older workflows stored the removed force-offload switch immediately
-        // after memory_mode. Drop that serialized value before LiteGraph maps
-        // the remaining values to widgets, so following settings do not shift.
-        if (
-            Array.isArray(info?.widgets_values)
-            && Array.isArray(this.widgets)
-            && info.widgets_values.length === this.widgets.length + 1
-        ) {
+        // after memory_mode. Identify it by its boolean value and the numeric
+        // handoff value that follows, rather than total widget count: newer
+        // optional controls may have been appended since the workflow saved.
+        if (Array.isArray(info?.widgets_values) && Array.isArray(this.widgets)) {
             const memoryIndex = this.widgets.findIndex(
                 (widget) => widget?.name === "memory_mode",
             );
-            if (memoryIndex >= 0) {
+            const legacyOffloadIndex = memoryIndex + 1;
+            if (
+                memoryIndex >= 0
+                && typeof info.widgets_values[legacyOffloadIndex] === "boolean"
+                && typeof info.widgets_values[legacyOffloadIndex + 1] === "number"
+            ) {
                 info.widgets_values.splice(memoryIndex + 1, 1);
             }
         }

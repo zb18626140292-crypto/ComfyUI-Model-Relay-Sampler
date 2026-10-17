@@ -21,6 +21,7 @@ import comfy.samplers
 import comfy.utils
 import latent_preview
 from comfy_api.latest import ComfyExtension, io
+from comfy_execution.graph_utils import GraphBuilder
 from typing_extensions import override
 
 _MIB = 1024 * 1024
@@ -63,10 +64,9 @@ class _TurboCache:
     effective threshold between corrections."""
 
     _MAX_EXTRAPOLATE = 1.5
-    _HISTORY = 3
-
     def __init__(self, threshold, start_percent, end_percent, max_consecutive_skips, cache_device,
-                 forecast="first", target_error=0.0, debug=False):
+                 forecast="first", target_error=0.0, debug=False, threshold_max=2.0,
+                 statistics=None):
         self.threshold = threshold
         self.start_percent = start_percent
         self.end_percent = end_percent
@@ -75,14 +75,21 @@ class _TurboCache:
         self.forecast = forecast
         self.target_error = target_error
         self.debug = debug
+        self.threshold_max = threshold_max
+        self.statistics = statistics
+        self.history_limit = 3 if forecast == "second" else 1 if forecast == "off" else 2
         self.streams = {}
+        self.schedule = None
 
     def reset(self):
         self.streams = {}
+        self.schedule = None
 
     def finish(self):
         full = sum(s.full_steps for s in self.streams.values())
         hits = sum(s.cache_hits for s in self.streams.values())
+        if self.statistics is not None:
+            self.statistics.update(full_forwards=full, cached_forwards=hits)
         drift_count = sum(s.drift_count for s in self.streams.values())
         if full + hits > 0:
             logging.info(
@@ -107,6 +114,7 @@ class _TurboCache:
         for s in self.streams.values():
             s.clear_tensors()
         self.streams = {}
+        self.schedule = None
 
     @staticmethod
     def _stream_key(x, context, ref_latents, transformer_options):
@@ -115,14 +123,18 @@ class _TurboCache:
         refs = tuple(tuple(r.shape) for r in (ref_latents or []))
         return (stream, tuple(x.shape), str(x.dtype), tuple(context.shape), refs)
 
-    @staticmethod
-    def _step_info(transformer_options):
+    def _step_info(self, transformer_options):
         sigmas = transformer_options.get("sigmas")
         sample_sigmas = transformer_options.get("sample_sigmas")
         if sigmas is None or sample_sigmas is None:
             return None
         sigma = float(sigmas[0])
-        schedule = [float(s) for s in sample_sigmas]
+        if self.schedule is None:
+            # The schedule is immutable inside one OUTER_SAMPLE invocation.
+            self.schedule = (sample_sigmas.detach().cpu().tolist()
+                             if torch.is_tensor(sample_sigmas)
+                             else [float(s) for s in sample_sigmas])
+        schedule = self.schedule
         step = min(range(len(schedule)), key=lambda i: abs(schedule[i] - sigma))
         percent = min(1.0, step / max(1, len(schedule) - 2))
         return sigma, percent
@@ -144,14 +156,20 @@ class _TurboCache:
             elif location == "auto":
                 free = comfy.model_management.get_free_memory(residual.device)
                 location = "gpu" if free > 10 * residual.numel() * residual.element_size() + 256 * _MIB else "cpu"
-            if location == "gpu":
+            reusable = (state.residuals.pop()[1]
+                        if len(state.residuals) >= self.history_limit else None)
+            device = residual.device if location == "gpu" else torch.device("cpu")
+            if (reusable is not None and reusable.shape == residual.shape
+                    and reusable.dtype == residual.dtype and reusable.device == device):
+                stored = reusable
+                stored.copy_(residual, non_blocking=False)
+            elif location == "gpu":
                 stored = residual.clone()
             else:
                 stored = torch.empty(residual.shape, dtype=residual.dtype, device="cpu",
                                      pin_memory=torch.cuda.is_available())
                 stored.copy_(residual, non_blocking=False)
             state.residuals.insert(0, (sigma, stored))
-            del state.residuals[self._HISTORY:]
 
     def _replay(self, state, x, sigma):
         """Residual for a cached step: plain replay, or sigma-space
@@ -218,7 +236,7 @@ class _TurboCache:
                         # measurements, so a shrunk threshold could never climb back
                         state.starve_count += 1
                         if state.starve_count >= 3:
-                            state.threshold_eff = min(threshold * 1.5, 2.0)
+                            state.threshold_eff = min(threshold * 1.5, self.threshold_max)
                             state.starve_count = 0
                             reason += f"; no skips for 3 steps, effective threshold raised to {state.threshold_eff:.3f}"
                 elif state.consecutive_skips >= self.max_consecutive_skips:
@@ -248,7 +266,7 @@ class _TurboCache:
                 if self.target_error > 0:
                     base = state.threshold_eff if state.threshold_eff is not None else self.threshold
                     ratio = min(max(self.target_error / max(err, 1e-4), 0.7), 1.3)
-                    state.threshold_eff = min(max(base * ratio, 0.05), 2.0)
+                    state.threshold_eff = min(max(base * ratio, 0.05), self.threshold_max)
                 if self.debug:
                     logging.info(
                         "QwenImage21Speedup: actual forward vs last replayed residual, relative error %.4f%s",
@@ -354,6 +372,83 @@ _SAMPLER_PRESETS = {
                end_percent=0.90, max_consecutive_skips=4),
 }
 
+_PREFIX_CACHE_MODES = ("安全关闭", "沿用输入模型设置")
+_GUIDANCE_CACHE_POLICIES = ("沿用原档位", "高CFG保真")
+_REDRAW_MODES = ("按交接噪声比例", "旧版噪声上限")
+
+
+def _sampler_preset(acceleration, cfg, guidance_cache_policy):
+    preset = _SAMPLER_PRESETS[acceleration].copy()
+    if guidance_cache_policy not in _GUIDANCE_CACHE_POLICIES:
+        raise ValueError("未知 CFG 缓存策略。")
+    if guidance_cache_policy == "高CFG保真" and cfg > 1.0:
+        factor = math.sqrt(cfg)
+        preset["threshold"] /= factor
+        preset["target_error"] /= factor
+        preset["start_percent"] = max(preset["start_percent"], 0.20)
+        preset["end_percent"] = min(preset["end_percent"], 0.85)
+        preset["max_consecutive_skips"] = min(preset["max_consecutive_skips"], 1 if cfg >= 4.0 else 2)
+        preset["threshold_max"] = max(0.05, preset["threshold"] * 1.5)
+    return preset
+
+
+class _ForwardCounter:
+    def __init__(self, statistics):
+        self.statistics = statistics
+
+    def __call__(self, executor, *args, **kwargs):
+        self.statistics["full_forwards"] += 1
+        return executor(*args, **kwargs)
+
+
+class _PhaseTimer:
+    """Run-local wall timings; no per-step CUDA synchronization."""
+
+    def __init__(self, statistics, field):
+        self.statistics = statistics
+        self.field = field
+
+    def __call__(self, executor, *args, **kwargs):
+        if self.field == "sampling_seconds":
+            sigmas = args[1] if len(args) > 1 else kwargs["sigmas"]
+            self.statistics["steps"] += max(0, sigmas.shape[-1] - 1)
+        started = time.perf_counter()
+        try:
+            return executor(*args, **kwargs)
+        finally:
+            self.statistics[self.field] = (
+                self.statistics.get(self.field, 0.0) + time.perf_counter() - started
+            )
+
+
+def _execution_result(results, statistics):
+    summaries = []
+    for index, stage in enumerate(statistics.get("stages", []), 1):
+        summaries.append(
+            f"模型{index}：{stage['steps']}步，实际前向{stage.get('full_forwards', 0)}次，"
+            f"缓存复用{stage.get('cached_forwards', 0)}次，阶段{stage['seconds']:.2f}秒"
+        )
+        if "prepare_seconds" in stage:
+            summaries.append(
+                f"  准备/加载{stage['prepare_seconds']:.2f}秒，采样{stage.get('sampling_seconds', 0.0):.2f}秒"
+            )
+    summaries.append(
+        f"输出：{statistics['width']}×{statistics['height']}，总计{statistics['total_seconds']:.2f}秒"
+    )
+    if "restart_sigma" in statistics:
+        summaries.append(
+            f"交接σ={statistics['handoff_sigma']:.4f}，重绘σ={statistics['restart_sigma']:.4f}"
+        )
+    elif "handoff_sigma" in statistics:
+        summaries.append(f"交接σ={statistics['handoff_sigma']:.4f}")
+    timings = statistics.get("timings", {})
+    if timings.get("unload_seconds", 0.0) or timings.get("upscale_seconds", 0.0):
+        summaries.append(
+            f"缩放{timings.get('upscale_seconds', 0.0):.2f}秒，卸载{timings.get('unload_seconds', 0.0):.2f}秒"
+        )
+    logging.info("QwenImage21 execution: %s", " | ".join(summaries))
+    return results
+
 
 class QwenImage21FastSampler:
     """Qwen 2.1 single-stage sampler using the existing run-scoped speedup.
@@ -387,6 +482,13 @@ class QwenImage21FastSampler:
             "cache_device": (("自动", "显存", "内存"),
                              {"default": "自动", "display_name": "残差缓存位置",
                               "tooltip": "auto 优先使用空闲显存，否则使用内存；与 Qwen 原生 KV 缓存不同。"}),
+        }, "optional": {
+            "prefix_cache_mode": (_PREFIX_CACHE_MODES,
+                                  {"default": "沿用输入模型设置", "display_name": "原生KV缓存",
+                                   "tooltip": "安全关闭会在模型副本上显式关闭原生KV，CFG>1报原生缓存错误时可用；沿用保留上游 Cache 节点设置。残差加速独立生效。"}),
+            "guidance_cache_policy": (_GUIDANCE_CACHE_POLICIES,
+                                      {"default": "沿用原档位", "display_name": "CFG缓存策略",
+                                       "tooltip": "高CFG保真会在CFG>1时收紧缓存阈值和连续复用次数，牺牲部分速度；不是手指/动作修复保证。沿用保持旧工作流行为。"}),
         }}
 
     RETURN_TYPES = ("LATENT",)
@@ -396,7 +498,9 @@ class QwenImage21FastSampler:
     DESCRIPTION = "Qwen-Image 2.1 专用单采：复用按步残差缓存，不改变参考图潜变量尺寸。"
 
     def sample(self, model, positive, negative, latent_image, seed, steps, cfg,
-               sampler_name, scheduler, denoise, acceleration, cache_device):
+               sampler_name, scheduler, denoise, acceleration, cache_device,
+               prefix_cache_mode="沿用输入模型设置", guidance_cache_policy="沿用原档位"):
+        total_started = time.perf_counter()
         if acceleration not in _SAMPLER_PRESETS and acceleration != "关闭":
             raise ValueError(f"未知加速档位: {acceleration}")
         diffusion_model = model.get_model_object("diffusion_model")
@@ -405,25 +509,32 @@ class QwenImage21FastSampler:
                 f"QwenImage21FastSampler 仅支持 {_MODEL_NAME}，实际为 {type(diffusion_model).__name__}"
             )
 
-        sampling_model = model.clone()
-        sampling_model.remove_wrappers_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, _PATCH_KEY)
-        sampling_model.remove_wrappers_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, _PATCH_KEY)
-        if acceleration != "关闭":
-            cache = _TurboCache(cache_device={"自动": "auto", "显存": "gpu", "内存": "cpu"}[cache_device],
-                                forecast="first",
-                                **_SAMPLER_PRESETS[acceleration])
-            sampling_model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, _PATCH_KEY, cache)
-            sampling_model.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, _PATCH_KEY,
-                                                _SamplingScope(cache))
+        if prefix_cache_mode not in _PREFIX_CACHE_MODES:
+            raise ValueError("未知原生 KV 缓存模式。")
+        stage_stats = {"steps": 0, "planned_steps": steps, "cfg": cfg,
+                       "full_forwards": 0, "cached_forwards": 0}
+        sampling_model = _dual_sampling_model(
+            model, acceleration, cache_device, prefix_cache_mode == "安全关闭",
+            cfg, guidance_cache_policy, stage_stats,
+        )
 
         import nodes as comfy_nodes
 
         started = time.perf_counter()
         try:
-            return comfy_nodes.common_ksampler(
+            results = comfy_nodes.common_ksampler(
                 sampling_model, seed, steps, cfg, sampler_name, scheduler,
                 positive, negative, latent_image, denoise=denoise,
             )
+            elapsed = time.perf_counter() - started
+            stage_stats["seconds"] = elapsed
+            ratio = int(model.get_model_object("latent_format").spacial_downscale_ratio)
+            statistics = {
+                "stages": [stage_stats], "width": int(results[0]["samples"].shape[-1]) * ratio,
+                "height": int(results[0]["samples"].shape[-2]) * ratio,
+                "total_seconds": time.perf_counter() - total_started,
+            }
+            return _execution_result(results, statistics)
         finally:
             logging.info(
                 "QwenImage21FastSampler: mode=%s, steps=%d, latent=%dx%d, "
@@ -436,8 +547,8 @@ class QwenImage21FastSampler:
 
 _DUAL_MISSING = object()
 _DUAL_STAGE_TWO_INPUTS = ("stage_two_model", "stage_two_positive", "stage_two_negative")
-_DUAL_MEMORY_MODES = ("省显存", "自动")
-_DUAL_PREFIX_CACHE_MODES = ("安全关闭", "沿用输入模型设置")
+_DUAL_MEMORY_MODES = ("省显存", "自动", "采样完成后卸载")
+_DUAL_PREFIX_CACHE_MODES = _PREFIX_CACHE_MODES
 
 
 def _dual_model_signature(model, stage_name):
@@ -480,10 +591,29 @@ def _dual_sigma_pair(model_one, model_two, steps_one, steps_two,
     sigmas_one = _dual_sigmas(model_one, steps_one, scheduler_one, denoise)
     sigmas_two = _dual_sigmas(model_two, steps_two, scheduler_two, denoise)
     if handoff_mode == "percent":
-        two_start = max(1, min(int(round(steps_two * handoff_value / 100.0)), steps_two - 1))
-    else:
-        target_sigma = 10.0 ** (-float(handoff_value) / 20.0)
-        two_start = _dual_nearest_sigma(sigmas_two, target_sigma)
+        # Strict integer allocation; SNR matching must not change the counts.
+        fraction = float(handoff_value) / 100.0
+        one_end = max(1, min(math.floor(steps_one * fraction + 0.5), steps_one - 1))
+        two_start = max(1, min(math.floor(steps_two * fraction + 0.5), steps_two - 1))
+        first = sigmas_one[:one_end + 1].clone()
+        boundary = first[-1].clone()
+        second = sigmas_two[two_start:].clone()
+        if float(boundary) <= 0.0 or float(second[0]) <= 0.0:
+            raise ValueError("百分比交接点的 sigma 必须大于 0，请降低交接百分比。")
+        # Rescale the remaining curve to the real incoming noise level while
+        # preserving its spacing and the requested number of stage-two steps.
+        second *= boundary / second[0].clone()
+        second[0] = boundary
+        if one_end < int(minimum_first_steps):
+            logging.warning(
+                "QwenImage21 percent: strict stage1=%s steps is below the upscale "
+                "reference minimum=%s; raise the handoff percent if stage one is unfinished.",
+                one_end, minimum_first_steps,
+            )
+        return first, second, one_end, two_start, float(boundary)
+
+    target_sigma = 10.0 ** (-float(handoff_value) / 20.0)
+    two_start = _dual_nearest_sigma(sigmas_two, target_sigma)
     boundary = sigmas_two[two_start].clone()
     if float(boundary) <= 0.0 or float(boundary) >= float(sigmas_one[0]):
         raise ValueError("两个 Qwen 模型的 sigma 时间线没有可用的交接区间。")
@@ -564,17 +694,23 @@ def _dual_target_latent_size(samples, model, final_width, final_height):
     return target_width, target_height
 
 
-def _dual_upscale_restart_sigmas(sigmas, strength):
+def _dual_upscale_restart_sigmas(sigmas, strength, mode="按交接噪声比例", sigma_max=None):
     boundary = float(sigmas[0])
-    restart = boundary * float(strength)
+    if mode not in _REDRAW_MODES:
+        raise ValueError("未知重绘强度定义。")
+    restart = (min(boundary, float(sigma_max) * float(strength))
+               if mode == "旧版噪声上限" else boundary * float(strength))
     scaled = sigmas * (restart / boundary)
     scaled[-1] = 0.0
     return scaled, restart
 
 
-def _dual_sampling_model(model, acceleration, cache_device, disable_prefix_cache):
+def _dual_sampling_model(model, acceleration, cache_device, disable_prefix_cache,
+                         cfg=1.0, guidance_cache_policy="沿用原档位", statistics=None):
     if acceleration not in _SAMPLER_PRESETS and acceleration != "关闭":
         raise ValueError(f"未知加速档位: {acceleration}")
+    if guidance_cache_policy not in _GUIDANCE_CACHE_POLICIES:
+        raise ValueError("未知 CFG 缓存策略。")
     sampling_model = model.clone()
     sampling_model.remove_wrappers_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, _PATCH_KEY)
     sampling_model.remove_wrappers_with_key(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, _PATCH_KEY)
@@ -585,7 +721,8 @@ def _dual_sampling_model(model, acceleration, cache_device, disable_prefix_cache
     if acceleration != "关闭":
         cache = _TurboCache(
             cache_device={"自动": "auto", "显存": "gpu", "内存": "cpu"}[cache_device],
-            forecast="first", **_SAMPLER_PRESETS[acceleration],
+            forecast="first", statistics=statistics,
+            **_sampler_preset(acceleration, cfg, guidance_cache_policy),
         )
         sampling_model.add_wrapper_with_key(
             comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, _PATCH_KEY, cache,
@@ -593,6 +730,20 @@ def _dual_sampling_model(model, acceleration, cache_device, disable_prefix_cache
         sampling_model.add_wrapper_with_key(
             comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, _PATCH_KEY, _SamplingScope(cache),
         )
+    elif statistics is not None:
+        sampling_model.add_wrapper_with_key(
+            comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, _PATCH_KEY, _ForwardCounter(statistics),
+        )
+    if statistics is not None:
+        statistics.setdefault("steps", 0)
+        statistics.setdefault("full_forwards", 0)
+        statistics.setdefault("cached_forwards", 0)
+        for wrapper, field in (
+            (comfy.patcher_extension.WrappersMP.PREPARE_SAMPLING, "prepare_seconds"),
+            (comfy.patcher_extension.WrappersMP.SAMPLER_SAMPLE, "sampling_seconds"),
+        ):
+            sampling_model.remove_wrappers_with_key(wrapper, _PATCH_KEY)
+            sampling_model.add_wrapper_with_key(wrapper, _PATCH_KEY, _PhaseTimer(statistics, field))
     return sampling_model
 
 
@@ -605,6 +756,103 @@ def _dual_sample_stage(model, positive, negative, cfg, sampler_name, sigmas,
         callback=callback, disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
         seed=seed,
     )
+
+
+def _dual_first_stage(model, positive, negative, latent, cfg, sampler_name, sigmas,
+                      seed, acceleration, cache_device, disable_prefix_cache,
+                      guidance_cache_policy, memory_mode, offload, statistics=None,
+                      normalized=False):
+    output = latent.copy()
+    if not normalized:
+        output["samples"] = comfy.sample.fix_empty_latent_channels(
+            model, latent["samples"], latent.get("downscale_ratio_spacial"),
+            latent.get("downscale_ratio_temporal"),
+        )
+    output.pop("downscale_ratio_spacial", None)
+    output.pop("downscale_ratio_temporal", None)
+    timings = statistics["timings"] if statistics is not None else None
+    if memory_mode == "省显存":
+        started = time.perf_counter()
+        comfy.model_management.unload_all_models()
+        if timings is not None:
+            timings["unload_seconds"] += time.perf_counter() - started
+    stage_stats = {"steps": 0, "cfg": cfg, "full_forwards": 0, "cached_forwards": 0}
+    if statistics is not None:
+        statistics["stages"].append(stage_stats)
+    sampling_model = _dual_sampling_model(
+        model, acceleration, cache_device, disable_prefix_cache, cfg,
+        guidance_cache_policy, stage_stats,
+    )
+    noise = comfy.sample.prepare_noise(output["samples"], seed, output.get("batch_index"))
+    started = time.perf_counter()
+    complete = False
+    try:
+        output["samples"] = _dual_sample_stage(
+            sampling_model, positive, negative, cfg, sampler_name, sigmas,
+            output["samples"], noise, output.get("noise_mask"), seed,
+        )
+        complete = True
+    finally:
+        stage_stats["seconds"] = time.perf_counter() - started
+        logging.info("QwenImage21Dual: stage1 elapsed=%.3fs", stage_stats["seconds"])
+        if offload or (memory_mode == "采样完成后卸载" and not complete):
+            _dual_unload(model, timings)
+    return output
+
+
+def _dual_second_stage(model, positive, negative, first_output, cfg, sampler_name,
+                       sigmas, seed, acceleration, cache_device, disable_prefix_cache,
+                       guidance_cache_policy, memory_mode, target_width, target_height,
+                       redraw_strength, redraw_mode, upscale_method, statistics=None):
+    output = first_output.copy()
+    samples = first_output["samples"].clone()
+    timings = statistics["timings"] if statistics is not None else None
+    stage_stats = {"steps": 0, "cfg": cfg, "full_forwards": 0, "cached_forwards": 0}
+    if statistics is not None:
+        statistics["stages"].append(stage_stats)
+    sampling_model = _dual_sampling_model(
+        model, acceleration, cache_device, disable_prefix_cache, cfg,
+        guidance_cache_policy, stage_stats,
+    )
+    if (target_width, target_height) != (samples.shape[-1], samples.shape[-2]):
+        started = time.perf_counter()
+        samples = comfy.utils.common_upscale(samples, target_width, target_height, upscale_method, "disabled")
+        sigmas, restart_sigma = _dual_upscale_restart_sigmas(
+            sigmas, redraw_strength, redraw_mode, model.get_model_object("model_sampling").sigma_max,
+        )
+        noise = comfy.sample.prepare_noise(samples, seed, output.get("batch_index"))
+        if timings is not None:
+            timings["upscale_seconds"] += time.perf_counter() - started
+            statistics["restart_sigma"] = restart_sigma
+        logging.info(
+            "QwenImage21Dual: clean latent upscaled to %dx%d, redraw=%.2f, restart_sigma=%.6f",
+            target_width, target_height, redraw_strength, restart_sigma,
+        )
+    else:
+        noise = torch.zeros_like(samples, device="cpu")
+    started = time.perf_counter()
+    try:
+        output["samples"] = _dual_sample_stage(
+            sampling_model, positive, negative, cfg, sampler_name, sigmas,
+            samples, noise, output.get("noise_mask"), seed,
+        )
+    finally:
+        stage_stats["seconds"] = time.perf_counter() - started
+        logging.info("QwenImage21Dual: stage2 elapsed=%.3fs", stage_stats["seconds"])
+        if memory_mode in ("省显存", "采样完成后卸载"):
+            _dual_unload(model, timings)
+    return output
+
+
+def _dual_sigma_payload(sigmas):
+    return {"values": sigmas.detach().cpu().tolist(), "dtype": str(sigmas.dtype).split(".")[-1]}
+
+
+def _dual_payload_sigmas(payload):
+    if torch.is_tensor(payload):
+        return payload
+    return torch.tensor(payload["values"], dtype=getattr(torch, payload["dtype"]),
+                        device=comfy.model_management.intermediate_device())
 
 
 def _dual_should_offload_first(model_one, model_two, memory_mode):
@@ -620,10 +868,15 @@ def _dual_should_offload_first(model_one, model_two, memory_mode):
     )
 
 
-def _dual_unload(model):
-    comfy.model_management.unload_model_and_clones(
-        model, unload_additional_models=True, all_devices=True,
-    )
+def _dual_unload(model, timings=None):
+    started = time.perf_counter()
+    try:
+        comfy.model_management.unload_model_and_clones(
+            model, unload_additional_models=True, all_devices=True,
+        )
+    finally:
+        if timings is not None:
+            timings["unload_seconds"] = timings.get("unload_seconds", 0.0) + time.perf_counter() - started
 
 
 def _dual_inputs(handoff_mode):
@@ -665,9 +918,9 @@ def _dual_inputs(handoff_mode):
     }
     if handoff_mode == "percent":
         required["handoff_percent"] = (
-            "FLOAT", {"default": 50.0, "min": 1.0, "max": 99.0, "step": 1.0,
+            "FLOAT", {"default": 50.0, "min": 1.0, "max": 99.0, "step": 0.01, "round": 0.01,
                       "display_name": "交接位置（百分比）",
-                      "tooltip": "按模型二时间表定位共同 sigma；40/40 步、50% 时通常是模型一约20步加模型二约20步。"},
+                      "tooltip": "支持小数点后两位，调整间隔0.01%；实际采样仍按整步执行。强制按各模型计划步数四舍五入分配，两边至少各1步；两边都为8步时，37%是3+5，50%是4+4。模型二时间表对齐一采交接噪声，不会反查或自动推迟一采步数。"},
         )
     else:
         required["handoff_snr_db"] = (
@@ -680,10 +933,10 @@ def _dual_inputs(handoff_mode):
                                            "tooltip": "关闭时只运行模型一完整时间表，交接与模型二参数不参与。"}),
         "prefix_cache_mode": (_DUAL_PREFIX_CACHE_MODES,
                               {"default": "安全关闭", "display_name": "双采KV缓存",
-                               "tooltip": "双采默认在模型副本上关闭 Qwen 原生 KV 缓存，避开已知多参考图交接错误；单采仍沿用输入模型设置。残差加速档继续生效。"}),
+                               "tooltip": "在模型副本上关闭 Qwen 原生 KV 缓存，适用于双采、多参考图或CFG>1缓存报错；关闭模型二时也生效。残差加速档继续生效。"}),
         "memory_mode": (_DUAL_MEMORY_MODES,
                         {"default": "省显存", "display_name": "显存模式",
-                         "tooltip": "省显存：采样前清旧模型，每阶段完成后卸载；自动：同模型尽量复用，不同模型交接时卸载模型一。"}),
+                         "tooltip": "省显存保持每阶段卸载；自动同模型尽量复用；采样完成后卸载只在最后卸载，同模型不同LoRA交接仍保留安全卸载。"}),
         "cache_device": (("自动", "显存", "内存"),
                          {"default": "自动", "display_name": "残差缓存位置",
                           "tooltip": "逐步残差缓存的位置，与原生 KV 缓存不同。"}),
@@ -702,15 +955,22 @@ def _dual_inputs(handoff_mode):
         "minimum_upscale_stage_one_steps": (
             "INT", {"default": 10, "min": 1, "max": 100,
                     "advanced": True, "display_name": "放大前最低一采步数",
-                    "tooltip": "仅中途放大时生效；交接过早会自动推迟共同 sigma，防止未成形图被放大。"},
+                    "tooltip": "仅中途放大时生效。SNR模式交接过早会自动推迟；百分比模式仅后台提示，不改变强制分步。若放大前图像未成形，请提高交接百分比。"},
         ),
     })
     optional = {
         "stage_two_model": ("MODEL", {"lazy": True, "display_name": "模型二"}),
         "stage_two_positive": ("CONDITIONING", {"lazy": True, "display_name": "模型二正向"}),
         "stage_two_negative": ("CONDITIONING", {"lazy": True, "display_name": "模型二负向"}),
+        "guidance_cache_policy": (_GUIDANCE_CACHE_POLICIES,
+                                  {"default": "沿用原档位", "display_name": "CFG缓存策略",
+                                   "tooltip": "高CFG保真在CFG>1时减少残差缓存复用，牺牲速度；沿用保持原加速档位参数。"}),
+        "redraw_mode": (_REDRAW_MODES,
+                        {"default": "按交接噪声比例", "display_name": "放大重绘噪声模式",
+                         "tooltip": "按交接噪声比例保持Qwen原行为：交接sigma×重绘强度；旧版噪声上限使用min(交接sigma,模型最大sigma×强度)。强度1时两者相同。"}),
     }
-    return {"required": required, "optional": optional}
+    return {"required": required, "optional": optional,
+            "hidden": {"dynprompt": "DYNPROMPT", "unique_id": "UNIQUE_ID"}}
 
 
 class _QwenImage21DualSampler:
@@ -737,6 +997,11 @@ class _QwenImage21DualSampler:
         return [name for name, value in inputs.items() if value is None]
 
     def _sample_impl(self, handoff_value, **kwargs):
+        dynprompt = kwargs.pop("dynprompt", None)
+        unique_id = kwargs.pop("unique_id", None)
+        total_started = time.perf_counter()
+        statistics = {"stages": [], "timings": {"upscale_seconds": 0.0, "unload_seconds": 0.0}}
+        timings = statistics["timings"]
         stage_two_inputs = [kwargs.get(name, _DUAL_MISSING) for name in _DUAL_STAGE_TWO_INPUTS]
         provided = [value is not _DUAL_MISSING and value is not None for value in stage_two_inputs]
         requested = kwargs["enable_stage_2"] == "开启"
@@ -755,6 +1020,10 @@ class _QwenImage21DualSampler:
             raise ValueError("未知显存模式。")
         if kwargs["prefix_cache_mode"] not in _DUAL_PREFIX_CACHE_MODES:
             raise ValueError("未知原生 KV 缓存模式。")
+        guidance_cache_policy = kwargs.get("guidance_cache_policy", "沿用原档位")
+        redraw_mode = kwargs.get("redraw_mode", "按交接噪声比例")
+        if guidance_cache_policy not in _GUIDANCE_CACHE_POLICIES or redraw_mode not in _REDRAW_MODES:
+            raise ValueError("未知 CFG 缓存策略或重绘强度定义。")
         if not 0.0 <= kwargs["denoise"] <= 1.0:
             raise ValueError("降噪强度必须在 0 到 1 之间。")
 
@@ -785,16 +1054,21 @@ class _QwenImage21DualSampler:
             if output.get("noise_mask") is not None:
                 raise ValueError("带噪声遮罩的潜变量暂不支持节点内部放大。")
             if not dual:
+                resize_started = time.perf_counter()
                 samples = comfy.utils.common_upscale(
                     samples, target_width, target_height, kwargs["upscale_method"], "disabled",
                 )
                 output["samples"] = samples
+                timings["upscale_seconds"] += time.perf_counter() - resize_started
                 logging.info(
                     "QwenImage21Dual: model two off; input latent resized before sampling to %dx%d",
                     target_width, target_height,
                 )
         if kwargs["denoise"] == 0.0:
-            return output, output.copy()
+            ratio = signature[3]
+            statistics.update(width=int(samples.shape[-1]) * ratio, height=int(samples.shape[-2]) * ratio,
+                              total_seconds=time.perf_counter() - total_started)
+            return _execution_result((output, output.copy()), statistics)
 
         if dual:
             first_sigmas, second_sigmas, first_count, second_start, boundary = _dual_sigma_pair(
@@ -808,6 +1082,7 @@ class _QwenImage21DualSampler:
                 self.HANDOFF_MODE, first_count, kwargs["stage_one_steps"],
                 kwargs["stage_two_steps"] - second_start, kwargs["stage_two_steps"], boundary,
             )
+            statistics["handoff_sigma"] = boundary
             if upscale_requested:
                 first_sigmas = first_sigmas.clone()
                 first_sigmas[-1] = 0.0
@@ -817,72 +1092,67 @@ class _QwenImage21DualSampler:
                 kwargs["denoise"],
             )
 
-        if kwargs["memory_mode"] == "省显存":
-            comfy.model_management.unload_all_models()
-        disable_prefix_cache = dual and kwargs["prefix_cache_mode"] == "安全关闭"
-        first_model = _dual_sampling_model(
-            model_one, kwargs["stage_one_acceleration"], kwargs["cache_device"],
-            disable_prefix_cache,
-        )
-        noise = comfy.sample.prepare_noise(samples, kwargs["seed"], output.get("batch_index"))
-        started = time.perf_counter()
-        try:
-            first_samples = _dual_sample_stage(
-                first_model, kwargs["stage_one_positive"], kwargs["stage_one_negative"],
-                kwargs["stage_one_cfg"], kwargs["stage_one_sampler"], first_sigmas,
-                samples, noise, output.get("noise_mask"), kwargs["seed"],
+        disable_prefix_cache = kwargs["prefix_cache_mode"] == "安全关闭"
+        first_offload = (kwargs["memory_mode"] == "省显存"
+                         or (dual and _dual_should_offload_first(model_one, model_two, kwargs["memory_mode"]))
+                         or (not dual and kwargs["memory_mode"] == "采样完成后卸载"))
+        if dual and dynprompt is not None:
+            raw = dynprompt.get_node(unique_id)["inputs"]
+            graph = GraphBuilder()
+            # Keep tensor/model inputs as source links so ComfyUI owns the
+            # checkpoint cache and upstream IS_CHANGED invalidation.
+            common = dict(seed=kwargs["seed"], cache_device=kwargs["cache_device"],
+                          disable_prefix_cache=disable_prefix_cache,
+                          guidance_cache_policy=guidance_cache_policy, memory_mode=kwargs["memory_mode"])
+            first = graph.node(
+                "QwenImage21FirstStage", id="first", model=raw["stage_one_model"],
+                positive=raw["stage_one_positive"], negative=raw["stage_one_negative"],
+                latent_image=raw["latent_image"], sigmas=_dual_sigma_payload(first_sigmas),
+                cfg=kwargs["stage_one_cfg"], sampler_name=kwargs["stage_one_sampler"],
+                acceleration=kwargs["stage_one_acceleration"], offload=first_offload, **common,
             )
-        finally:
-            logging.info("QwenImage21Dual: stage1 elapsed=%.3fs", time.perf_counter() - started)
-            if kwargs["memory_mode"] == "省显存" or (
-                dual and _dual_should_offload_first(model_one, model_two, kwargs["memory_mode"])
-            ):
-                _dual_unload(model_one)
-        first_output = output.copy()
-        first_output["samples"] = first_samples
-        if not dual:
-            return first_output.copy(), first_output
+            second = graph.node(
+                "QwenImage21SecondStage", id="second", first_result=first.out(0),
+                model=raw["stage_two_model"], previous_model=raw["stage_one_model"],
+                positive=raw["stage_two_positive"], negative=raw["stage_two_negative"],
+                sigmas=_dual_sigma_payload(second_sigmas), cfg=kwargs["stage_two_cfg"],
+                sampler_name=kwargs["stage_two_sampler"], acceleration=kwargs["stage_two_acceleration"],
+                target_width=target_width, target_height=target_height,
+                redraw_strength=kwargs["redraw_strength"], redraw_mode=redraw_mode,
+                upscale_method=kwargs["upscale_method"], **common,
+            )
+            return {"result": (second.out(0), first.out(0)), "expand": graph.finalize()}
 
-        second_model = _dual_sampling_model(
-            model_two, kwargs["stage_two_acceleration"], kwargs["cache_device"],
-            disable_prefix_cache,
+        first_output = _dual_first_stage(
+            model_one, kwargs["stage_one_positive"], kwargs["stage_one_negative"], output,
+            kwargs["stage_one_cfg"], kwargs["stage_one_sampler"], first_sigmas, kwargs["seed"],
+            kwargs["stage_one_acceleration"], kwargs["cache_device"], disable_prefix_cache,
+            guidance_cache_policy, kwargs["memory_mode"], first_offload, statistics, normalized=True,
         )
-        if upscale_requested:
-            second_input = comfy.utils.common_upscale(
-                first_samples, target_width, target_height, kwargs["upscale_method"], "disabled",
-            )
-            second_sigmas, restart_sigma = _dual_upscale_restart_sigmas(
-                second_sigmas, kwargs["redraw_strength"],
-            )
-            second_noise = comfy.sample.prepare_noise(
-                second_input, kwargs["seed"], output.get("batch_index"),
-            )
-            logging.info(
-                "QwenImage21Dual: clean latent upscaled to %dx%d, redraw=%.2f, restart_sigma=%.6f",
-                target_width, target_height, kwargs["redraw_strength"], restart_sigma,
-            )
-        else:
-            second_input = first_samples
-            second_noise = torch.zeros_like(first_samples, device="cpu")
-        started = time.perf_counter()
-        try:
-            final_samples = _dual_sample_stage(
-                second_model, stage_two_inputs[1], stage_two_inputs[2],
-                kwargs["stage_two_cfg"], kwargs["stage_two_sampler"], second_sigmas,
-                second_input, second_noise, output.get("noise_mask"), kwargs["seed"],
-            )
-        finally:
-            logging.info("QwenImage21Dual: stage2 elapsed=%.3fs", time.perf_counter() - started)
-            if kwargs["memory_mode"] == "省显存":
-                _dual_unload(model_two)
-        final_output = output.copy()
-        final_output["samples"] = final_samples
-        return final_output, first_output
+        first_samples = first_output["samples"]
+        if not dual:
+            statistics.update(width=int(first_samples.shape[-1]) * signature[3],
+                              height=int(first_samples.shape[-2]) * signature[3],
+                              total_seconds=time.perf_counter() - total_started)
+            return _execution_result((first_output.copy(), first_output), statistics)
+
+        final_output = _dual_second_stage(
+            model_two, stage_two_inputs[1], stage_two_inputs[2], first_output,
+            kwargs["stage_two_cfg"], kwargs["stage_two_sampler"], second_sigmas, kwargs["seed"],
+            kwargs["stage_two_acceleration"], kwargs["cache_device"], disable_prefix_cache,
+            guidance_cache_policy, kwargs["memory_mode"], target_width, target_height,
+            kwargs["redraw_strength"], redraw_mode, kwargs["upscale_method"], statistics,
+        )
+        final_samples = final_output["samples"]
+        statistics.update(width=int(final_samples.shape[-1]) * signature[3],
+                          height=int(final_samples.shape[-2]) * signature[3],
+                          total_seconds=time.perf_counter() - total_started)
+        return _execution_result((final_output, first_output), statistics)
 
 
 class QwenImage21DualPercentSampler(_QwenImage21DualSampler):
     HANDOFF_MODE = "percent"
-    DESCRIPTION = "Qwen Image 2.1 专用百分比双采；两套时间表在同一 sigma 交接，不重复加噪。"
+    DESCRIPTION = "Qwen Image 2.1 专用百分比双采；强制按各模型计划步数四舍五入分配，模型二时间表对齐一采交接噪声。两边都为8步时37%就是3+5，内部放大不会自动推迟百分比分步。"
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -914,11 +1184,75 @@ async def comfy_entrypoint():
     return QwenImage21SpeedupExtension()
 
 
+class _QwenImage21FirstStage:
+    DEV_ONLY = True
+    CATEGORY = "_internal/qwen_image21"
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "sample"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model": ("MODEL",), "positive": ("CONDITIONING",), "negative": ("CONDITIONING",),
+            "latent_image": ("LATENT",), "sigmas": ("SIGMAS",), "cfg": ("FLOAT",),
+            "sampler_name": (comfy.samplers.KSampler.SAMPLERS,), "seed": ("INT",),
+            "acceleration": (("均衡", "保真", "快速", "关闭"),),
+            "cache_device": (("自动", "显存", "内存"),), "disable_prefix_cache": ("BOOLEAN",),
+            "guidance_cache_policy": (_GUIDANCE_CACHE_POLICIES,),
+            "memory_mode": (_DUAL_MEMORY_MODES,), "offload": ("BOOLEAN",),
+        }}
+
+    def sample(self, model, positive, negative, latent_image, sigmas, cfg,
+               sampler_name, seed, acceleration, cache_device, disable_prefix_cache,
+               guidance_cache_policy, memory_mode, offload):
+        return (_dual_first_stage(
+            model, positive, negative, latent_image, cfg, sampler_name, _dual_payload_sigmas(sigmas),
+            seed, acceleration, cache_device, disable_prefix_cache,
+            guidance_cache_policy, memory_mode, offload,
+        ),)
+
+
+class _QwenImage21SecondStage:
+    DEV_ONLY = True
+    CATEGORY = "_internal/qwen_image21"
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "sample"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        required = _QwenImage21FirstStage.INPUT_TYPES()["required"]
+        required.pop("latent_image")
+        required.pop("offload")
+        required.update({
+            "previous_model": ("MODEL",), "first_result": ("LATENT",),
+            "target_width": ("INT",), "target_height": ("INT",),
+            "redraw_strength": ("FLOAT",), "redraw_mode": (_REDRAW_MODES,),
+            "upscale_method": (("bislerp", "bilinear", "bicubic", "nearest-exact", "area"),),
+        })
+        return {"required": required}
+
+    def sample(self, model, previous_model, positive, negative, first_result, sigmas, cfg,
+               sampler_name, seed, acceleration, cache_device, disable_prefix_cache,
+               guidance_cache_policy, memory_mode, target_width, target_height,
+               redraw_strength, redraw_mode, upscale_method):
+        if memory_mode == "省显存":
+            comfy.model_management.unload_all_models()
+        elif _dual_should_offload_first(previous_model, model, memory_mode):
+            _dual_unload(previous_model)
+        return (_dual_second_stage(
+            model, positive, negative, first_result, cfg, sampler_name, _dual_payload_sigmas(sigmas),
+            seed, acceleration, cache_device, disable_prefix_cache, guidance_cache_policy,
+            memory_mode, target_width, target_height, redraw_strength, redraw_mode, upscale_method,
+        ),)
+
+
 NODE_CLASS_MAPPINGS = {
     "QwenImage21Speedup": QwenImage21Speedup,
     "QwenImage21FastSampler": QwenImage21FastSampler,
     "QwenImage21DualPercentSampler": QwenImage21DualPercentSampler,
     "QwenImage21DualSNRSampler": QwenImage21DualSNRSampler,
+    "QwenImage21FirstStage": _QwenImage21FirstStage,
+    "QwenImage21SecondStage": _QwenImage21SecondStage,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "QwenImage21Speedup": "Qwen Image 2.1 Speedup",
